@@ -5,6 +5,7 @@ import numpy.ma as ma
 import pandas as pd
 import enum
 import math
+import os
 from django.utils.translation import gettext as _
 from rest_framework.response import Response
 from ldms.analysis.vegetation_index import VegetationIndex
@@ -106,6 +107,58 @@ class ProductivitySettings:
     DEFAULT_BASELINE_END_YEAR = (
         2015  # default baseline end year when computing main productivity indicator
     )
+
+
+def classify_trajectory_chunks(
+    ndvi_rasters, time_array, nodata, chunk_pixels=250000
+):
+    """Classify trajectory pixels while keeping the working set bounded."""
+    raster_shape = ndvi_rasters[0].shape
+    flattened_rasters = [raster.reshape(-1) for raster in ndvi_rasters]
+    out_values = np.full(
+        flattened_rasters[0].shape,
+        fill_value=nodata,
+        dtype=np.int32,
+    )
+    time_values = np.asarray(time_array, dtype=np.float64)
+    centered_time = time_values - time_values.mean()
+    slope_denominator = np.dot(centered_time, centered_time)
+
+    for chunk_start in range(0, out_values.size, chunk_pixels):
+        chunk_end = min(chunk_start + chunk_pixels, out_values.size)
+        chunk = np.column_stack(
+            [raster[chunk_start:chunk_end] for raster in flattened_rasters]
+        )
+        valid_mask = np.all(chunk != nodata, axis=1)
+        if not valid_mask.any():
+            continue
+
+        valid_values = chunk[valid_mask]
+        slopes = np.dot(valid_values, centered_time) / slope_denominator
+        pvalues = np.fromiter(
+            (
+                stats.kendalltau(time_values, values)[1]
+                for values in valid_values
+            ),
+            dtype=np.float64,
+            count=valid_values.shape[0],
+        )
+        mapped = np.full(
+            valid_values.shape[0],
+            fill_value=TrajectoryChangeTernaryEnum.STABLE.key,
+            dtype=np.int32,
+        )
+        significant = pvalues <= ProductivitySettings.PVALUE_CUTOFF
+        mapped[significant & (slopes >= 0)] = (
+            TrajectoryChangeTernaryEnum.IMPROVED.key
+        )
+        mapped[significant & (slopes < 0)] = (
+            TrajectoryChangeTernaryEnum.DEGRADED.key
+        )
+        chunk_output = out_values[chunk_start:chunk_end]
+        chunk_output[valid_mask] = mapped
+
+    return out_values.reshape(raster_shape)
 
 
 class Productivity:
@@ -384,40 +437,6 @@ class Productivity:
         5. compute the raster statistics to be returned together with the raster
         """
 
-        def get_linear_regression(item):
-            """Get the slope"""
-            # slope, intercept, r_value, p_value, std_err = stats.linregress(time_array, item['values'])
-            data = extract_period_values(item)
-            if data == nodata:
-                return nodata
-
-            slope, intercept, r_value, p_value, std_err = stats.linregress(
-                time_array, data
-            )
-            return slope
-
-        def extract_period_values(item):
-            data = []
-            # Extract values for all the periods to form the data series
-            for i, tm in enumerate(time_array):
-                val = item[str(tm)]
-                if (
-                    val == nodata
-                ):  # if any value has nodata, then return nodata as val of slope
-                    return nodata
-                data.append(val)
-            return data
-
-        def get_pvalue(item):
-            """Get pvalue"""
-            data = extract_period_values(item)
-            if data == nodata:
-                return nodata
-            tau, p_value = stats.kendalltau(time_array, data)
-            # tau, p_value = stats.kendalltau(time_array, [item['base'], item['target']])
-            # p_value = p_value if not np.isnan(p_value) else 1.
-            return p_value
-
         error, vector, start_model, end_model, start_year, end_year = self.prevalidate()
         if error:
             return self.return_with_error(error)
@@ -498,17 +517,6 @@ class Productivity:
 
         time_array = [x.raster_year for x in ndvi_models]
 
-        """
-		stack pixel values. This will put all pixel values at specific location 
-		into one single array such that values at the same location for different 
-		pixel location will be contained in a single array. The array will be of size 
-		(raster_rows, raster_cols, no_of_rasters)
-
-		To get mean of rasters by their positions, use the below form
-			np.mean(np.dstack([x, y, z]).transpose(), axis=0).transpose()
-		"""
-        rasters = np.dstack(ndvi_rasters)
-
         if len(ndvi_rasters) != len(time_array):
             error = _(
                 "The number of available datasets is different from the number of periods selected. Number of datasets is {0} while the number of periods is {1}. Ensure there is a dataset for each of the years within the reporting period.".format(
@@ -517,87 +525,14 @@ class Productivity:
             )
             return self.return_with_error(error)
 
-        # Create dataframe
-        df = pd.DataFrame()
-        # create dynamic index for each reporting period
-        for i, tm in enumerate(time_array):
-            df[str(tm)] = ndvi_rasters[i].flatten()
-
-        df["mapping"] = nodata  # initialize all to nodata
-        df["slope"] = nodata  # initialize all to nodata
-        df["pvalue"] = nodata  # initialize all to nodata
-
-        # create masks
-        nodata_masks = []
-        for i, tm in enumerate(time_array):
-            msk = df[str(tm)] == nodata
-            nodata_masks.append(msk)
-
-        # Compute slope
-        # 1.  compute slope
-        """
-		do linear regression on every pixel and for this 
-		we are getting the r/ship btwn base and target years pixel values
-		We only consider slope and the p_value. stats.linregress returns values as below
-			slope, intercept, r_value, p_value, std_err = stats.linregress(time_array, data_array).
-		linregress() uses Wald Test with t-distribution, not mann kandell, so we use kendalltau since
-		we want to do a non-parametric significance test
-		"""
-        # for those values that have not changed, the slope is 0
-        df.loc[~np.logical_and.reduce(nodata_masks), ["slope"]] = (
-            0  # combine and apply masks
+        # Previously this copied every annual raster into one full-size
+        # DataFrame, created an unused np.dstack copy, and retained a full-size
+        # nodata mask per year. The classifier now bounds those allocations.
+        out_raster = classify_trajectory_chunks(
+            ndvi_rasters=ndvi_rasters,
+            time_array=time_array,
+            nodata=nodata,
         )
-
-        # Only do regression where pixel values have changed
-        df.loc[~np.logical_and.reduce(nodata_masks), ["slope"]] = df.apply(
-            lambda x: get_linear_regression(x), axis=1
-        )
-
-        # get p value
-        # 2. Compute pvalues to perform significance test
-        """
-		If p Value is more than cutoff, then its stable.
-		p value will be nan if both x and y are the same. if values 
-		of x (base) and y (target) are same, it returns nan values.	
-		"""
-        # get p value where the base and target are different, else assign p value to 1.0
-        df.loc[~np.logical_and.reduce(nodata_masks), ["pvalue"]] = df.apply(
-            lambda x: get_pvalue(x), axis=1
-        )
-
-        # set mapping to stable first for all non-masked values
-        df.loc[~np.logical_and.reduce(nodata_masks), ["mapping"]] = (
-            TrajectoryChangeTernaryEnum.STABLE.key
-        )
-
-        # 3. Set transitions.
-        """
-		Degraded: If pvalue <= ProductivitySettings.PVALUE_CUTOFF and slope < 0
-		Improved: If pvalue <= ProductivitySettings.PVALUE_CUTOFF and slope > 0
-		Stable: If pvalue > ProductivitySettings.PVALUE_CUTOFF or (pvalue <= ProductivitySettings.PVALUE_CUTOFF and slope = 0)
-		"""
-        significant_pvalue_mask = df["pvalue"] <= ProductivitySettings.PVALUE_CUTOFF
-
-        # improved
-        improved_mask = df["slope"] >= 0
-        df.loc[
-            ~np.logical_and.reduce(nodata_masks)
-            & improved_mask
-            & significant_pvalue_mask,
-            ["mapping"],
-        ] = TrajectoryChangeTernaryEnum.IMPROVED.key
-
-        # degraded
-        degraded_mask = df["slope"] < 0
-        df.loc[
-            ~np.logical_and.reduce(nodata_masks)
-            & degraded_mask
-            & significant_pvalue_mask,
-            ["mapping"],
-        ] = TrajectoryChangeTernaryEnum.DEGRADED.key
-
-        # reshape the pd.series into 2d array
-        out_raster = df["mapping"].values.reshape(ndvi_rasters[0].shape)
 
         # Clip the raster and save for later referencing
         meta_raster, meta_raster_path, nodata = clip_raster_to_vector(
@@ -1117,28 +1052,27 @@ class Productivity:
 		Improved: If change >= 2
 		Stable: If -2<=change<=2
 		"""
-        df = pd.DataFrame(
-            {"base": base_raster.flatten(), "target": comparison_raster.flatten()}
+        valid = (base_raster != nodata) & (comparison_raster != nodata)
+        difference = np.subtract(
+            comparison_raster,
+            base_raster,
+            where=valid,
+            out=np.zeros(base_raster.shape, dtype=np.float64),
         )
-        df["mapping"] = nodata  # initialize all to nodata
-
-        nodata_mask = (df["base"] == nodata) | (df["target"] == nodata)
-        df.loc[~nodata_mask, ["diff"]] = df["target"] - df["base"]
-
-        # set mapping to stable first for all non-masked values
-        df.loc[~nodata_mask, ["mapping"]] = StateChangeTernaryEnum.STABLE.key
-
-        improved_mask = df["diff"] > ProductivitySettings.STATE_CHANGE_POSITIVE_CUTOFF
-        df.loc[~nodata_mask & improved_mask, ["mapping"]] = (
-            StateChangeTernaryEnum.IMPROVED.key
+        out_raster = np.full(
+            base_raster.shape,
+            fill_value=nodata,
+            dtype=np.int32,
         )
-
-        degraded_mask = df["diff"] < ProductivitySettings.STATE_CHANGE_NEGATIVE_CUTOFF
-        df.loc[~nodata_mask & degraded_mask, ["mapping"]] = (
-            StateChangeTernaryEnum.DEGRADED.key
-        )
-
-        out_raster = df["mapping"].values.reshape(base_raster.shape)
+        out_raster[valid] = StateChangeTernaryEnum.STABLE.key
+        out_raster[
+            valid
+            & (difference > ProductivitySettings.STATE_CHANGE_POSITIVE_CUTOFF)
+        ] = StateChangeTernaryEnum.IMPROVED.key
+        out_raster[
+            valid
+            & (difference < ProductivitySettings.STATE_CHANGE_NEGATIVE_CUTOFF)
+        ] = StateChangeTernaryEnum.DEGRADED.key
 
         return return_raster_with_stats(
             request=self.request,
@@ -1429,6 +1363,14 @@ class Productivity:
                     model.rasterfile.name, vector
                 )
                 rasters_list.append(raster)
+                # extract_pixels_using_vector returns an in-memory array and a
+                # temporary on-disk copy. The trajectory calculation only uses
+                # the array, so retaining one large TIFF per year wastes tens
+                # of GiB for country-level requests.
+                try:
+                    os.remove(rastfile)
+                except (OSError, TypeError):
+                    pass
             period += 1
         return rasters_list
 
@@ -2249,22 +2191,21 @@ class Productivity:
         )
 
         """If ratio < 0.5, then degraded else stable"""
-        df = pd.DataFrame({"ratio": ratios.flatten()})
-        df["mapping"] = nodata
-        df[np.isnan(df["ratio"])] = nodata
-
-        degraded_mask = df["ratio"] < ProductivitySettings.PERFORMANCE_DEGRADED_CUTOFF
-        stable_mask = df["ratio"] >= ProductivitySettings.PERFORMANCE_DEGRADED_CUTOFF
-        valid_data = df["ratio"] != nodata
-        df.loc[degraded_mask & valid_data, ["mapping"]] = (
-            PerformanceChangeBinaryEnum.DEGRADED.key
+        ratio_values = np.asarray(ma.filled(ratios, nodata))
+        valid_data = (ratio_values != nodata) & ~np.isnan(ratio_values)
+        datasource = np.full(
+            ratio_values.shape,
+            fill_value=nodata,
+            dtype=np.int32,
         )
-        df.loc[stable_mask & valid_data, ["mapping"]] = (
-            PerformanceChangeBinaryEnum.STABLE.key
-        )
-
-        datasource = df["mapping"].values.reshape(ratios.shape)
-        datasource = datasource.astype(np.int32)
+        datasource[
+            valid_data
+            & (ratio_values < ProductivitySettings.PERFORMANCE_DEGRADED_CUTOFF)
+        ] = PerformanceChangeBinaryEnum.DEGRADED.key
+        datasource[
+            valid_data
+            & (ratio_values >= ProductivitySettings.PERFORMANCE_DEGRADED_CUTOFF)
+        ] = PerformanceChangeBinaryEnum.STABLE.key
 
         self.max_ndvi_raster = max_ndvi_raster  # just for unit testing purposes
         self.mean_ndvi = mean_ndvi  # just for unit testing purposes
@@ -2319,25 +2260,39 @@ class Productivity:
         state_array = rasters[1]
         perf_array = rasters[2]
 
-        df = pd.DataFrame(
-            {
-                "trajectory": traj_array.flatten(),
-                "state": state_array.flatten(),
-                "performance": perf_array.flatten(),
-            }
+        raster_shape = traj_array.shape
+        trajectory_values = traj_array.reshape(-1)
+        state_values = state_array.reshape(-1)
+        performance_values = perf_array.reshape(-1)
+        datasource_values = np.full(
+            trajectory_values.shape,
+            fill_value=nodata,
+            dtype=np.int32,
         )
-        df["mapping"] = nodata
-        for row in prod_matrix:
-            # filter all matching entries as per the matrix
-            mask = (
-                (df["trajectory"] == row["traj"])
-                & (df["state"] == row["state"])
-                & (df["performance"] == row["perf"])
-            )
-            df.loc[mask, ["mapping"]] = row["mapping"]
+        chunk_pixels = 250000
 
-        datasource = df["mapping"].values.reshape(traj_array.shape)
-        datasource = datasource.astype(np.int32)
+        for chunk_start in range(0, datasource_values.size, chunk_pixels):
+            chunk_end = min(chunk_start + chunk_pixels, datasource_values.size)
+            trajectory_chunk = trajectory_values[chunk_start:chunk_end]
+            state_chunk = state_values[chunk_start:chunk_end]
+            performance_chunk = performance_values[chunk_start:chunk_end]
+            output_chunk = datasource_values[chunk_start:chunk_end]
+
+            valid = (
+                (trajectory_chunk != nodata)
+                & (state_chunk != nodata)
+                & (performance_chunk != nodata)
+            )
+            for row in prod_matrix:
+                mask = (
+                    valid
+                    & (trajectory_chunk == row["traj"])
+                    & (state_chunk == row["state"])
+                    & (performance_chunk == row["perf"])
+                )
+                output_chunk[mask] = row["mapping"]
+
+        datasource = datasource_values.reshape(raster_shape)
 
         return return_raster_with_stats(
             request=self.request,

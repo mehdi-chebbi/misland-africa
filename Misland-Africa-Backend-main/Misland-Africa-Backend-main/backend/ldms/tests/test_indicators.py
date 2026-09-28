@@ -6,7 +6,8 @@ from rest_framework.test import APITestCase, RequestsClient, URLPatternsTestCase
 from common.utils.common_util import get_random_string, get_random_int
 import numpy as np
 import numpy.ma as ma
-from ldms.analysis.productivity import Productivity
+from ldms.analysis.productivity import Productivity, classify_trajectory_chunks
+from ldms.enums import TrajectoryChangeTernaryEnum
 from django.conf import settings
 
 import json
@@ -19,6 +20,33 @@ class ProductivityTest(TestCase):
 	def tearDown(self):
 		# Clean up run after every test method.
 		pass
+
+	def test_trajectory_classification_is_chunk_safe(self):
+		"""Chunk boundaries preserve classification and nodata handling."""
+		years = [2000, 2001, 2002, 2003, 2004]
+		nodata = settings.DEFAULT_NODATA
+		rasters = []
+		for year_index in range(len(years)):
+			rasters.append(np.array([[
+				year_index,
+				4 - year_index,
+				7,
+				nodata if year_index == 2 else year_index,
+			]]))
+
+		result = classify_trajectory_chunks(
+			ndvi_rasters=rasters,
+			time_array=years,
+			nodata=nodata,
+			chunk_pixels=2,
+		)
+		expected = np.array([[
+			TrajectoryChangeTernaryEnum.IMPROVED.key,
+			TrajectoryChangeTernaryEnum.DEGRADED.key,
+			TrajectoryChangeTernaryEnum.STABLE.key,
+			nodata,
+		]], dtype=np.int32)
+		self.assertTrue(np.array_equal(result, expected))
 
 	def test_performance_no_missing_data(self):
 		"""

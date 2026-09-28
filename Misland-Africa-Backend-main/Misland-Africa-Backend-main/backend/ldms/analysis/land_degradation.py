@@ -7,7 +7,6 @@ from ldms.enums import (ClimaticRegionEnum, LandDegradationTernaryChangeEnum,
 		ProductivityChangeTernaryEnum, SOCChangeEnum, LulcChangeEnum, RasterCategoryEnum)
 from common_gis.utils.raster_util import (extract_pixels_using_vector, get_raster_meta, clip_raster_to_vector,
 				return_raster_with_stats, get_raster_models)
-import pandas as pd
 import numpy as np
 from common_gis.utils.vector_util import get_vector
 from common import ModelNotExistError 
@@ -135,33 +134,54 @@ class LandDegradation:
 
 		self.initialize_degradation_matrix()
 
-		df = pd.DataFrame({
-						'productivity': prod_array.flatten(),
-						'soc': soc_array.flatten(),
-						'lulc': lulc_array.flatten()
-					})
-		df['mapping'] = nodata
+		raster_shape = prod_array.shape
+		productivity_values = prod_array.reshape(-1)
+		soc_values = soc_array.reshape(-1)
+		lulc_values = lulc_array.reshape(-1)
+		datasource_values = np.full(
+			productivity_values.shape,
+			fill_value=nodata,
+			dtype=np.int32,
+		)
+		chunk_pixels = 250000
 
-		if LandDegrationSettings.OUTPUT_BINARY:
-			# If any of the indicators has degraded, then output degraded else output not-degraded
-			degraded_mask = (df['productivity'] == ProductivityChangeTernaryEnum.DEGRADED.key) | (df['soc'] == SOCChangeEnum.DEGRADED.key) | (df['lulc'] == LulcChangeEnum.DEGRADED.key)
-			nodata_mask = (df['productivity'] != nodata) & (df['soc'] != nodata) & (df['lulc'] != nodata)
-			df.loc[degraded_mask, ['mapping']] = LandDegradationTernaryChangeEnum.DEGRADED.key
+		for chunk_start in range(0, datasource_values.size, chunk_pixels):
+			chunk_end = min(chunk_start + chunk_pixels, datasource_values.size)
+			productivity_chunk = productivity_values[chunk_start:chunk_end]
+			soc_chunk = soc_values[chunk_start:chunk_end]
+			lulc_chunk = lulc_values[chunk_start:chunk_end]
+			output_chunk = datasource_values[chunk_start:chunk_end]
+			valid = (
+				(productivity_chunk != nodata)
+				& (soc_chunk != nodata)
+				& (lulc_chunk != nodata)
+			)
 
-			# exclude no_data values
-			df.loc[~degraded_mask & nodata_mask, ['mapping']] = LandDegradationTernaryChangeEnum.IMPROVED.key
-		else:
-			# Replace values
-			for row in self.degradation_matrix:
-				# filter all matching entries as per the matrix
-				mask = (df['productivity'] == row['prod']) & (df['soc'] == row['soc']) & (df['lulc'] == row['lulc'])
-				if row['mapping'] == LandDegradationTernaryChangeEnum.STABLE and LandDegrationSettings.OVERRIDE_STABLE:
-					df.loc[mask, ['mapping']] = LandDegradationTernaryChangeEnum.IMPROVED
-				else:
-					df.loc[mask, ['mapping']] = row['mapping']
-		
-		datasource = df['mapping'].values.reshape(prod_array.shape)
-		datasource = datasource.astype(np.int32)
+			if LandDegrationSettings.OUTPUT_BINARY:
+				degraded = valid & (
+					(productivity_chunk == ProductivityChangeTernaryEnum.DEGRADED.key)
+					| (soc_chunk == SOCChangeEnum.DEGRADED.key)
+					| (lulc_chunk == LulcChangeEnum.DEGRADED.key)
+				)
+				output_chunk[valid] = LandDegradationTernaryChangeEnum.IMPROVED.key
+				output_chunk[degraded] = LandDegradationTernaryChangeEnum.DEGRADED.key
+			else:
+				for row in self.degradation_matrix:
+					mask = (
+						valid
+						& (productivity_chunk == row['prod'])
+						& (soc_chunk == row['soc'])
+						& (lulc_chunk == row['lulc'])
+					)
+					mapping = row['mapping']
+					if (
+						mapping == LandDegradationTernaryChangeEnum.STABLE
+						and LandDegrationSettings.OVERRIDE_STABLE
+					):
+						mapping = LandDegradationTernaryChangeEnum.IMPROVED.key
+					output_chunk[mask] = mapping
+
+		datasource = datasource_values.reshape(raster_shape)
 
 		return return_raster_with_stats(
 			request=self.request,
