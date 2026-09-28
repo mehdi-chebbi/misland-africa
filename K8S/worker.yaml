@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: misland-africa
+spec:
+  replicas: 2
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: misland-worker}
+  template:
+    metadata:
+      labels: {app: misland-worker}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: worker-prod-01}
+      containers:
+        - name: worker
+          image: mehdino123/misland-backend:k8s-v2
+          imagePullPolicy: IfNotPresent
+          command: [python, manage.py, rqworker, default, low, high, extra_high, --with-scheduler]
+          envFrom:
+            - configMapRef: {name: misland-config}
+            - secretRef: {name: misland-secrets}
+          resources:
+            requests:
+              cpu: "1"
+              memory: 24Gi
+            limits:
+              cpu: "2"
+              memory: 64Gi
+          volumeMounts:
+            - {name: media, mountPath: /home/app/web/media}
+            - {name: gee, mountPath: /run/secrets/gee_private_key.json, subPath: gee-private-key.json, readOnly: true}
+            - {name: firebase, mountPath: /run/secrets/firebase_private_key.json, subPath: firebase-private-key.json, readOnly: true}
+      volumes:
+        - name: media
+          hostPath: {path: /data/misland-media, type: Directory}
+        - name: gee
+          secret: {secretName: misland-secrets}
+        - name: firebase
+          secret: {secretName: misland-secrets}

@@ -1,0 +1,14 @@
+{% autoescape off %} Dear {{ user.first_name }} {{ user.last_name }}, <br />
+<p>
+  Your task which was requested for <b>{{aoi}}</b> on {{scheduled_date}} for
+  <b>{{task_name}}</b> analysis has been completed.
+</p>
+<p>
+  You can download the resulting analysis from
+  <a href="{{rasterfile}}">here</a>.
+</p>
+<p>
+  You can also click on this <a href="{{endpoint}}">link</a> to view the results
+  on the map. <br />
+</p>
+Do not reply to this email. {% endautoescape %}

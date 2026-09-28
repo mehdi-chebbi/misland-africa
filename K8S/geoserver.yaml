@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: geoserver
+  namespace: misland-africa
+spec:
+  type: ClusterIP
+  selector: {app: misland-geoserver}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: geoserver
+  namespace: misland-africa
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: misland-geoserver}
+  template:
+    metadata:
+      labels: {app: misland-geoserver}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: worker-prod-01}
+      containers:
+        - name: geoserver
+          image: kartoza/geoserver:2.20.1
+          envFrom:
+            - configMapRef: {name: misland-config}
+            - secretRef: {name: misland-secrets}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            timeoutSeconds: 10
+          volumeMounts:
+            - {name: data, mountPath: /opt/geoserver/data_dir}
+            - {name: settings, mountPath: /settings}
+            - {name: media, mountPath: /home/app/web/media, readOnly: true}
+      volumes:
+        - name: data
+          hostPath: {path: /data/misland-geoserver, type: Directory}
+        - name: settings
+          hostPath: {path: /data/misland-geoserver-settings, type: DirectoryOrCreate}
+        - name: media
+          hostPath: {path: /data/misland-media, type: Directory}

@@ -1,0 +1,6 @@
+.env
+runtime/
+K8S/secret.yaml
+*.dump
+*.pem
+*_private_key.json

@@ -1,0 +1,176 @@
+name: misland
+
+x-backend: &backend
+  build:
+    context: ./Misland-Africa-Backend-main/Misland-Africa-Backend-main/backend
+    dockerfile: Dockerfile.prod
+  env_file: [./.env]
+  environment:
+    XDG_CACHE_HOME: /tmp/.cache
+  restart: unless-stopped
+
+x-backend-volumes: &backend-volumes
+  - static_data:/home/app/web/static
+  - type: bind
+    source: ./runtime/migration/gee_private_key.json
+    target: /run/secrets/gee_private_key.json
+    read_only: true
+  - type: bind
+    source: ./runtime/migration/firebase_private_key.json
+    target: /run/secrets/firebase_private_key.json
+    read_only: true
+  - type: bind
+    source: ${MISLAND_MEDIA_PATH:-/data/misland-media}
+    target: /home/app/web/media
+
+services:
+  db:
+    image: kartoza/postgis:9.6-2.4
+    restart: unless-stopped
+    env_file: [./.env]
+    command: postgres -c max_connections=1000
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - postgres_config:/etc/postgresql
+      - postgres_logs:/var/log/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD=$$POSTGRES_PASS psql
+          -h 127.0.0.1
+          -p $${POSTGRES_PORT:-5432}
+          -U $$POSTGRES_USER
+          -d $$POSTGRES_DBNAME
+          -c 'SELECT 1' >/dev/null 2>&1
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes: [redis_data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend-init:
+    <<: *backend
+    restart: "no"
+    command: >-
+      sh -c "python manage.py migrate --noinput &&
+      python manage.py createcachetable &&
+      python manage.py collectstatic --noinput"
+    volumes: *backend-volumes
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  web:
+    <<: *backend
+    command: >-
+      sh -c "exec gunicorn oss_ldms.wsgi:application
+      --workers=$${GUNICORN_WORKERS:-4}
+      --timeout=$${GUNICORN_TIMEOUT:-7200}
+      --bind 0.0.0.0:8000"
+    expose: ["8000"]
+    volumes: *backend-volumes
+    depends_on:
+      backend-init: {condition: service_completed_successfully}
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  worker:
+    <<: *backend
+    command: python manage.py rqworker default low high extra_high --with-scheduler
+    volumes: *backend-volumes
+    depends_on:
+      backend-init: {condition: service_completed_successfully}
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  backend-proxy:
+    build:
+      context: ./Misland-Africa-Backend-main/Misland-Africa-Backend-main/nginx
+    restart: unless-stopped
+    ports: ["${BACKEND_PORT:-1337}:80"]
+    volumes:
+      - static_data:/home/app/web/static:ro
+      - type: bind
+        source: ${MISLAND_MEDIA_PATH:-/data/misland-media}
+        target: /home/app/web/media
+        read_only: true
+    depends_on:
+      web: {condition: service_started}
+
+  frontend:
+    build:
+      context: ./Misland-Africa-Frontend-main/Misland-Africa-Frontend-main
+      dockerfile: Dockerfile.prod
+      args:
+        API_BASE_URL: ${PUBLIC_API_BASE_URL:-/}
+        MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN:-}
+        CONTACT_FORM_ENDPOINT: ${CONTACT_FORM_ENDPOINT:-}
+    restart: unless-stopped
+    ports: ["${FRONTEND_PORT:-80}:80"]
+    depends_on:
+      backend-proxy: {condition: service_started}
+
+  geoserver:
+    image: kartoza/geoserver:2.20.1
+    restart: unless-stopped
+    env_file: [./.env]
+    environment:
+      GEOSERVER_ADMIN_USER: ${GEOSERVER_ADMIN_USER}
+      GEOSERVER_ADMIN_PASSWORD: ${GEOSERVER_ADMIN_PASSWORD}
+      RESET_ADMIN_CREDENTIALS: ${RESET_ADMIN_CREDENTIALS:-FALSE}
+    volumes:
+      - type: bind
+        source: ${GEOSERVER_DATA_PATH:-/data/misland-geoserver}
+        target: ${GEOSERVER_DATA_DIR:-/opt/geoserver/data_dir}
+      - geoserver_settings:/settings
+    depends_on:
+      db: {condition: service_healthy}
+
+  geoserver-gateway:
+    image: nginx:1.25-alpine
+    restart: unless-stopped
+    ports: ["8600:8600"]
+    volumes:
+      - ./deployment/geoserver-gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      geoserver: {condition: service_started}
+
+  dbbackups:
+    image: kartoza/pg-backup:9.6
+    profiles: [backup]
+    restart: on-failure
+    env_file: [./.env]
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASS}
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DBNAME}
+      DUMPPREFIX: ${DUMPPREFIX:-PG_oss_ldms}
+      CRON_SCHEDULE: ${CRON_SCHEDULE:-0 2 * * *}
+      REMOVE_BEFORE: ${REMOVE_BEFORE:-30}
+    volumes:
+      - type: bind
+        source: ${DB_BACKUP_PATH:-/data/misland-db-backups}
+        target: /backups
+    depends_on:
+      db: {condition: service_healthy}
+
+volumes:
+  postgres_data:
+  postgres_config:
+  postgres_logs:
+  redis_data:
+  static_data:
+  geoserver_settings:

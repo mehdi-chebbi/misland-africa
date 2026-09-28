@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: Service
+metadata: {name: backend, namespace: misland-africa}
+spec:
+  type: ClusterIP
+  selector: {app: misland-backend}
+  ports:
+    - {name: http, port: 8000, targetPort: 8000}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: backend, namespace: misland-africa}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: misland-backend}
+  template:
+    metadata:
+      labels: {app: misland-backend}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: worker-prod-01}
+      containers:
+        - name: backend
+          image: mehdino123/misland-backend:k8s-v2
+          imagePullPolicy: IfNotPresent
+          command: [sh, -c]
+          args: ['exec gunicorn oss_ldms.wsgi:application --workers=${GUNICORN_WORKERS:-2} --timeout=${GUNICORN_TIMEOUT:-7200} --bind 0.0.0.0:8000']
+          envFrom:
+            - configMapRef: {name: misland-config}
+            - secretRef: {name: misland-secrets}
+          ports:
+            - {name: http, containerPort: 8000}
+          readinessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          volumeMounts:
+            - {name: media, mountPath: /home/app/web/media}
+            - {name: static, mountPath: /home/app/web/static}
+            - {name: gee, mountPath: /run/secrets/gee_private_key.json, subPath: gee-private-key.json, readOnly: true}
+            - {name: firebase, mountPath: /run/secrets/firebase_private_key.json, subPath: firebase-private-key.json, readOnly: true}
+      volumes:
+        - name: media
+          hostPath: {path: /data/misland-media, type: Directory}
+        - name: static
+          hostPath: {path: /data/misland-static, type: DirectoryOrCreate}
+        - name: gee
+          secret: {secretName: misland-secrets}
+        - name: firebase
+          secret: {secretName: misland-secrets}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: backend-proxy, namespace: misland-africa}
+spec:
+  type: ClusterIP
+  selector: {app: misland-backend-proxy}
+  ports:
+    - {name: http, port: 80, targetPort: 80}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: backend-proxy, namespace: misland-africa}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: misland-backend-proxy}
+  template:
+    metadata:
+      labels: {app: misland-backend-proxy}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: worker-prod-01}
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - {name: http, containerPort: 80}
+          volumeMounts:
+            - {name: config, mountPath: /etc/nginx/conf.d/default.conf, subPath: backend.conf, readOnly: true}
+            - {name: media, mountPath: /home/app/web/media, readOnly: true}
+            - {name: static, mountPath: /home/app/web/static, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: misland-nginx-config}
+        - name: media
+          hostPath: {path: /data/misland-media, type: Directory}
+        - name: static
+          hostPath: {path: /data/misland-static, type: DirectoryOrCreate}

@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: misland-config, namespace: misland-africa}
+data:
+  ENV_TYPE: DEV
+  DEBUG: "0"
+  DB_ENGINE: django.contrib.gis.db.backends.postgis
+  DB_TYPE: postgres
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  REDIS_HOST: redis
+  QUEUED_JOB_TIMEOUT: "10800"
+  FILTER_COUNTRIES: "1"
+  PUBLISHED_COUNTRIES: "Tunisia,Algeria,Egypt,Libya,Mauritania,Benin"
+  DJANGO_ALLOWED_HOSTS: "194.163.176.189 misland.oss-online.org 41.227.30.141 10.1.60.103 10.1.60.101 localhost 0.0.0.0 127.0.0.1 .ngrok.io [::1]"
+  SENTRY_ENABLED: "0"
+  SENTRY_DSN: "https://e5e6c139c5dd4897811df870cce9d3fc@o1339318.ingest.sentry.io/6752866"
+  GEOSERVER_HOST_PRIVATE: http://geoserver
+  GEOSERVER_HOST_PUBLIC: ""
+  GEOSERVER_PUBLIC_URL: /geoserver
+  GEOSERVER_PORT: "8080"
+  GEOSERVER_IGNORE_PRIVATE_HOST: "0"
+  GEOSERVER_DATA_DIR: /opt/geoserver/data_dir
+  GEOWEBCACHE_CACHE_DIR: /opt/geoserver/data_dir/gwc
+  EXISTING_DATA_DIR: "true"
+  RESET_ADMIN_CREDENTIALS: "FALSE"
+  INITIAL_MEMORY: 2G
+  MAXIMUM_MEMORY: 4G
+  INITIAL_HEAP_OCCUPANCY_PERCENT: "45"
+  DISABLE_WEB_INTERFACE: "false"
+  ROOT_WEBAPP_REDIRECT: "false"
+  TOMCAT_EXTRAS: "true"
+  LOGIN_STATUS: "on"
+  PUID: "1000"
+  PGID: "10001"
+  GUNICORN_WORKERS: "2"
+  GUNICORN_TIMEOUT: "7200"
+  GOOGLE_PRIVATE_KEY_FILE: /run/secrets/gee_private_key.json
+  GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gee_private_key.json
+  FIREBASE_APPLICATION_CREDENTIALS: /run/secrets/firebase_private_key.json
+  XDG_CACHE_HOME: /tmp/.cache
+  USE_LOG_FILE: "0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: misland-nginx-config, namespace: misland-africa}
+data:
+  backend.conf: |
+    server {
+      listen 80;
+      client_max_body_size 100G;
+      proxy_read_timeout 7200;
+      proxy_send_timeout 7200;
+      location / {
+        proxy_pass http://backend:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+      }
+      location /static/ { alias /home/app/web/static/; }
+      location /media/ {
+        alias /home/app/web/media/;
+        add_header Access-Control-Allow-Origin *;
+      }
+    }
+  frontend.conf: |
+    server {
+      listen 80;
+      server_name _;
+      root /usr/share/nginx/html;
+      index index.html;
+      client_max_body_size 100G;
+      location ^~ /api/ {
+        proxy_pass http://backend-proxy;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 7200;
+        proxy_send_timeout 7200;
+      }
+      location ^~ /media/ { proxy_pass http://backend-proxy; }
+      location ^~ /static/ { proxy_pass http://backend-proxy; }
+      location ^~ /geoserver/ {
+        proxy_pass http://geoserver:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 7200;
+        proxy_send_timeout 7200;
+      }
+      location / { try_files $uri $uri/ /index.html; }
+      location ~* \.(?:css|js|jpg|jpeg|gif|png|svg|ico|webp|woff2?)$ {
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+      }
+    }

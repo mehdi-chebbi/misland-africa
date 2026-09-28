@@ -1,0 +1,9 @@
+{% autoescape off %} Dear {{ user.first_name }} {{ user.last_name }}, <br />
+<p>
+  Your task which was requested for <b>{{aoi}}</b> on
+  <b>{{scheduled_date}} </b>for {{task_name}} could not be completed because of
+  the following reason: {{ error }}. Kindly try again.
+</p>
+<br />
+<p>Do not reply to this email.</p>
+{% endautoescape %}
